@@ -169,7 +169,7 @@ ls /usr/bin
 ```
 
 至少需要分区 **2、3、7、10、11、12、15、18**。转储可用
-[../a7m3-connect-shell](../a7m3-connect-shell) 只读 `pull`。
+[a7m3-connect-shell](https://github.com/Derek2011cc/a7m3-connect-shell) 只读 `pull`。
 
 ## 磁盘与时间
 
@@ -195,7 +195,7 @@ ls /usr/bin
 - [ma1co/fwtool.py](https://github.com/ma1co/fwtool.py) — Sony 固件包解析；
 - [QEMU](https://www.qemu.org/) — 全系统模拟器；
 - 前序 A7M3 逆向报告（本仓库 `report/2026-10-17-qemu-native-camera/a7m3`）— 启动链、补丁脚本与踩坑记录；
-- [a7m3-connect-shell](../a7m3-connect-shell) — 服务模式分区转储工具。
+- [a7m3-connect-shell](https://github.com/Derek2011cc/a7m3-connect-shell) — 服务模式分区转储工具。
 
 ## 许可
 
