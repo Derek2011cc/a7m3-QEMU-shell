@@ -1,6 +1,12 @@
-# a7m3-QEMU
+# a7m3-QEMU-shell
 
 在 QEMU 里启动 Sony **ILCE-7M3（A7M3）** 原厂 4.03 固件，进入相机的 BusyBox shell（`/ #`）。
+
+> **本仓库是 [A7M3-Firmware-QEMU-Boot-Experiment](https://github.com/Derek2011cc/A7M3-Firmware-QEMU-Boot-Experiment)
+> 的支线仓库**，用于“下载即可用”地部署 A7M3 虚拟机 shell。
+> 启动链、补丁原理、逆向过程与更完整的技术细节请参考主仓库
+> [A7M3-Firmware-QEMU-Boot-Experiment](https://github.com/Derek2011cc/A7M3-Firmware-QEMU-Boot-Experiment)；
+> 本仓库只保留运行所需的最小集合、预编译 QEMU 和固件分片。
 
 **下载即可用**：仓库已包含内核、initrd、压缩分片的 eMMC 镜像，以及预编译 QEMU；
 首次运行会自动还原镜像并启动，不需要自己准备固件或编译。
