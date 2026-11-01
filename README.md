@@ -141,6 +141,7 @@ ls /usr/bin
 ## 已知现象（正常）
 
 - `im.elf` 启动失败并进入 `Exception>`：默认 GPU 打桩的预期行为；
+- 如果没有出现 `Exception>`，shell 可能已经在后台运行，直接输入命令即可；
 - `dma330` 附近可能停顿约 10 秒；
 - 输入 `exit` 后打印 `Good Bye.`，进入 `/ #`；
 - 镜像使用 `snapshot=on`，退出后不修改原文件。
