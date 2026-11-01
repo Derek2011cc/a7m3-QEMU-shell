@@ -1,3 +1,7 @@
+> 项目有借助大量AI工具，请注意辨别
+>
+> qq交流群:736434809
+
 # a7m3-QEMU-shell
 
 在 QEMU 里启动 Sony **ILCE-7M3（A7M3）** 原厂 4.03 固件，进入相机的 BusyBox shell（`/ #`）。
