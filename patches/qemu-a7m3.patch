@@ -1,0 +1,1110 @@
+diff --git a/hw/arm/bionz.c b/hw/arm/bionz.c
+index 3c146fb..2feca9d 100644
+--- a/hw/arm/bionz.c
++++ b/hw/arm/bionz.c
+@@ -2,6 +2,7 @@
+ 
+ #include "qemu/osdep.h"
+ #include "cpu.h"
++#include "exec/address-spaces.h"
+ #include "hw/sysbus.h"
+ #include "hw/block/flash.h"
+ #include "hw/boards.h"
+@@ -16,6 +17,8 @@
+ #include "sysemu/block-backend.h"
+ #include "sysemu/sysemu.h"
+ #include "target/arm/arm-tcm.h"
++#include "ui/console.h"
++#include "qemu/timer.h"
+ 
+ //////////////////////////// CXD4108 ////////////////////////////
+ #define CXD4108_NAND_BASE 0x00000000
+@@ -210,10 +213,41 @@
+ #define CXD90014_INITRD_OFFSET 0x00628000
+ 
+ //////////////////////////// CXD90045 ////////////////////////////
++/* A7M3 (CXD90045): the kernel is linked with PAGE_OFFSET 0x60000000 and
++ * PHYS_OFFSET 0, so it is loaded at physical DDR0_BASE + TEXT_OFFSET and
++ * its link addresses (0x60108000+) are virtual. */
+ #define CXD90045_DDR0_BASE 0x00000000
++/* The 4.03 main kernel's real boot parameters live in nflasha2:/kemco.txt
++ * (not the updater's nflasha1/BOOT/KEMCO.TXT):
++ *   mem=1G@0, mem=256M@0x80000000@1,
++ *   memrsv=704M@0x14000000:uc, memrsv=14M@0x80000000:uc,
++ *   memrsv=242M@0x80e00000:uc, plus smaller reservations.
++ * parse_memrsv() feeds the "uc" regions into Sony's noncache address table
++ * at 0x604e07e0; without them arch_phys_to_noncache() rejects LIRO's
++ * 0x8bdc1200 buffers (inside DDR1). */
+ #define CXD90045_DDR0_SIZE 0x40000000
++/* DDR1: 256 MiB at 0x80000000 (main kernel mem=256M@0x80000000@1). */
+ #define CXD90045_DDR1_BASE 0x80000000
+-#define CXD90045_DDR1_SIZE 0x40000000
++#define CXD90045_DDR1_SIZE 0x10000000
++/* LIRO co-processor register window.  The firmware polls 0xf2a1102c bit1
++ * (and later other status bits); QEMU does not model this block yet.  This
++ * experimental region stores writes and can optionally return all-ones for
++ * never-written registers to emulate "ready" status bits. */
++#define CXD90045_LIRO_BASE 0xf2a00000
++#define CXD90045_LIRO_SIZE 0x00023000
++#define CXD90045_LIRO_NUM_REGS (CXD90045_LIRO_SIZE / 4)
++/* Sugilite ("sugi") graphics engine BAR, seen in grm_gles.ko:
++ * the driver ioremaps 0xf1000000 (size 0x4000) and userspace maps the same
++ * page via /dev/mem.  The engine is kicked by writing (value|0x20000000) to
++ * BAR+0xc0 relative to a per-engine base; completion is reported through the
++ * BAR+0x34 status register and GIC IRQ 76.  A full rasteriser is out of
++ * scope; this model completes every kick immediately so driver waits do not
++ * hang, and traces register traffic for further reverse engineering. */
++#define CXD90045_SUGI_BASE 0xf1000000
++#define CXD90045_SUGI_SIZE 0x00004000
++#define CXD90045_SUGI_NUM_REGS (CXD90045_SUGI_SIZE / 4)
++#define CXD90045_SUGI_NUM_BLOCKS (CXD90045_SUGI_SIZE / 0x1000)
++#define CXD90045_IRQ_SUGI 76
+ #define CXD90045_DDRC_BASE(i) (0xf0104000 + (i) * 0x1000)
+ #define CXD90045_SRAM_BASE 0xfe000000
+ #define CXD90045_SRAM_SIZE 0x01000000
+@@ -241,6 +275,11 @@
+ 
+ #define CXD90045_TEXT_OFFSET 0x00108000
+ #define CXD90045_INITRD_OFFSET 0x00700000
++#define CXD90045_ATAGS_ADDR (CXD90045_DDR0_BASE + 0x00010000)
++/* Memory-related options copied from the main kernel's real boot config
++ * (eMMC image, around file offset 0x9bcad0).  The `mem=` lines are omitted
++ * because the same banks are already supplied through ATAG_MEM. */
++#define CXD90045_CMDLINE "console=ttyAM0,115200 root=/dev/ram0 rw ignore_loglevel earlyprintk initcall_debug ip=off log_buf_len=4M memrsv=1M@0 memrsv=0x8000@0xF00000 memrsv=0x1A5E000@0x02E68000 memrsv=0xA6EB000@0x09915000 memrsv=704M@0x14000000:uc memrsv=14M@0x80000000:uc memrsv=242M@0x80e00000:uc"
+ 
+ #define NAND_SECTOR_SIZE 0x200
+ #define NAND_PAGE_SIZE 0x1000
+@@ -380,6 +419,70 @@ static void cxd_write_bootloader(hwaddr base, hwaddr target)
+     rom_add_blob_fixed("bootloader", loader, sizeof(loader), base);
+ }
+ 
++/* Local experiment: minimal ATAGS for the ARM32 Linux boot protocol. */
++static void cxd90045_write_atags(uint32_t addr, uint32_t initrd_start,
++                                 uint32_t initrd_size, const char *cmdline)
++{
++    uint32_t buffer[256];
++    uint32_t *p = buffer;
++    int len = strlen(cmdline) + 1;
++    int words = (len + 3) / 4;
++
++    /* ATAG layout: size first, then tag (struct tag_header). */
++    *p++ = 5;         /* ATAG_CORE */
++    *p++ = 0x54410001;
++    *p++ = 0;
++    *p++ = 4096;
++    *p++ = 0;
++
++    /* struct tag_mem32 { __u32 size; __u32 start; } */
++    *p++ = 4;         /* ATAG_MEM: DDR0 at 0x60000000, 1 GiB */
++    *p++ = 0x54410002;
++    *p++ = CXD90045_DDR0_SIZE;
++    *p++ = CXD90045_DDR0_BASE;
++
++    *p++ = 4;         /* ATAG_MEM: DDR1, 256 MiB at 0x80000000 */
++    *p++ = 0x54410002;
++    *p++ = CXD90045_DDR1_SIZE;
++    *p++ = CXD90045_DDR1_BASE;
++
++    *p++ = 2 + words; /* ATAG_CMDLINE */
++    *p++ = 0x54410009;
++    memset(p, 0, words * 4);
++    memcpy(p, cmdline, len);
++    p += words;
++
++    *p++ = 4;         /* ATAG_INITRD2 (0x54420005; 0x54410005 is deprecated ATAG_INITRD) */
++    *p++ = 0x54420005;
++    *p++ = initrd_start;
++    *p++ = initrd_size;
++
++    *p++ = 0;         /* ATAG_NONE */
++    *p++ = 0;
++
++    rom_add_blob_fixed("atags", buffer, (p - buffer) * 4, addr);
++}
++
++/* Local experiment: set r0/r1/r2 for the ARM32 Linux boot protocol. */
++static void cxd_write_bootloader_with_machine(hwaddr base, hwaddr target,
++                                              uint32_t machine, uint32_t atags)
++{
++    int i;
++    uint32_t loader[] = {
++        0xe3a00000, /* mov r0, #0 */
++        0xe59f200c, /* ldr r2, [pc, #12] */
++        0xe59f1004, /* ldr r1, [pc, #4] */
++        0xe51ff004, /* ldr pc, [pc, #-4] */
++        target,
++        machine,
++        atags,
++    };
++    for (i = 0; i < ARRAY_SIZE(loader); i++) {
++        loader[i] = tswap32(loader[i]);
++    }
++    rom_add_blob_fixed("bootloader", loader, sizeof(loader), base);
++}
++
+ static void cxd4108_init(MachineState *machine)
+ {
+     DriveInfo *dinfo;
+@@ -978,6 +1081,762 @@ static void cxd90014_init(MachineState *machine)
+     cxd_add_const_reg("fusb_otg_usb_id_ext", CXD90014_USB_OTG_BASE + 0x10, 2);
+ }
+ 
++/* Experimental LIRO register window: see docs/LIRO-AND-MEMORY.md.
++ * Writes are stored; reads of never-written registers return zero, or
++ * all-ones when A7M3_LIRO_AUTOREADY is set in the environment. */
++typedef struct CXD90045LiroState {
++    uint32_t regs[CXD90045_LIRO_NUM_REGS];
++    uint8_t written[CXD90045_LIRO_NUM_REGS];
++    unsigned trace_count;
++} CXD90045LiroState;
++
++static bool cxd90045_liro_trace(void)
++{
++    static int enabled = -1;
++    if (enabled < 0) {
++        enabled = getenv("A7M3_LIRO_TRACE") != NULL;
++    }
++    return enabled;
++}
++
++static bool cxd90045_liro_autoready(void)
++{
++    static int enabled = -1;
++    if (enabled < 0) {
++        enabled = getenv("A7M3_LIRO_AUTOREADY") != NULL;
++    }
++    return enabled;
++}
++
++static bool cxd90045_liro_status_reg(uint32_t offset)
++{
++    uint32_t low = offset & 0xfff;
++    return low == 0x004 || low == 0x02c;
++}
++
++static uint64_t cxd90045_liro_read(void *opaque, hwaddr offset, unsigned size)
++{
++    CXD90045LiroState *s = opaque;
++    uint32_t idx = offset >> 2;
++    uint32_t value;
++    uint32_t pc = 0, lr = 0;
++
++    if (idx >= CXD90045_LIRO_NUM_REGS) {
++        return 0;
++    }
++    if (s->written[idx]) {
++        value = s->regs[idx];
++    } else if (cxd90045_liro_autoready() &&
++               cxd90045_liro_status_reg((uint32_t)offset)) {
++        value = 0xffffffffu;
++    } else {
++        value = 0;
++    }
++    if (current_cpu) {
++        pc = ARM_CPU(current_cpu)->env.regs[15];
++        lr = ARM_CPU(current_cpu)->env.regs[14];
++    }
++    if (cxd90045_liro_trace() && s->trace_count < 4000 &&
++        pc >= 0x635c0000 && pc < 0x65000000) {
++        fprintf(stderr,
++                "A7M3-LIRO RD[%u] pc=%08x lr=%08x off=%04x val=%08x size=%u\n",
++                s->trace_count, pc, lr, (unsigned)offset, value, size);
++        s->trace_count++;
++    }
++    return value;
++}
++
++static void cxd90045_liro_write(void *opaque, hwaddr offset, uint64_t value,
++                                unsigned size)
++{
++    CXD90045LiroState *s = opaque;
++    uint32_t idx = offset >> 2;
++    uint32_t pc = 0, lr = 0;
++
++    if (idx >= CXD90045_LIRO_NUM_REGS) {
++        return;
++    }
++    /* The register at instance offset 0x030 is a "start and self-clear"
++     * bit: firmware writes 1, then polls until the register reads 0. */
++    if ((offset & 0xfff) == 0x030) {
++        s->regs[idx] = 0;
++    } else {
++        s->regs[idx] = (uint32_t)value;
++    }
++    s->written[idx] = 1;
++    if (current_cpu) {
++        pc = ARM_CPU(current_cpu)->env.regs[15];
++        lr = ARM_CPU(current_cpu)->env.regs[14];
++    }
++    if (cxd90045_liro_trace() && s->trace_count < 4000 &&
++        pc >= 0x635c0000 && pc < 0x65000000) {
++        fprintf(stderr,
++                "A7M3-LIRO WR[%u] pc=%08x lr=%08x off=%04x val=%08x size=%u\n",
++                s->trace_count, pc, lr, (unsigned)offset, (unsigned)value, size);
++        s->trace_count++;
++    }
++}
++
++static const MemoryRegionOps cxd90045_liro_ops = {
++    .read = cxd90045_liro_read,
++    .write = cxd90045_liro_write,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++    .endianness = DEVICE_NATIVE_ENDIAN,
++};
++
++/* Minimal Sugilite graphics engine model: stores registers, completes every
++ * kick by raising IRQ 76 with a synthetic status value, and clears pending
++ * state when the driver writes the ack registers observed in grm_gles.ko. */
++#define TYPE_CXD90045_SUGI "cxd90045_sugi"
++#define CXD90045_SUGI(obj) \
++    OBJECT_CHECK(CXD90045SugiState, (obj), TYPE_CXD90045_SUGI)
++
++typedef struct CXD90045SugiState {
++    SysBusDevice parent_obj;
++    MemoryRegion mmio;
++    qemu_irq irq;
++    uint32_t regs[CXD90045_SUGI_NUM_REGS];
++    uint32_t status[CXD90045_SUGI_NUM_BLOCKS];
++    uint8_t pending[CXD90045_SUGI_NUM_BLOCKS];
++    uint32_t irq_status;
++    unsigned trace_count;
++} CXD90045SugiState;
++
++static bool cxd90045_sugi_trace(void)
++{
++    static int enabled = -1;
++    if (enabled < 0) {
++        enabled = getenv("A7M3_SUGI_TRACE") != NULL;
++    }
++    return enabled;
++}
++
++static bool cxd90045_sugi_ack_off(uint32_t low)
++{
++    return low == 0xc18 || low == 0x01c || low == 0x03c || low == 0x044;
++}
++
++static uint64_t cxd90045_sugi_read(void *opaque, hwaddr offset, unsigned size)
++{
++    CXD90045SugiState *s = opaque;
++    uint32_t idx = offset >> 2;
++    uint32_t low = offset & 0xfff;
++    uint32_t val;
++
++    if (idx >= CXD90045_SUGI_NUM_REGS) {
++        return 0;
++    }
++    val = s->regs[idx];
++    if (low == 0x034 && s->irq_status) {
++        val = s->irq_status;
++    }
++    if (cxd90045_sugi_trace() && s->trace_count < 4000) {
++        uint32_t pc = 0, lr = 0;
++        CPUState *cpu = current_cpu;
++        if (cpu) {
++            pc = ARM_CPU(cpu)->env.regs[15];
++            lr = ARM_CPU(cpu)->env.regs[14];
++        }
++        fprintf(stderr, "A7M3-SUGI RD[%u] pc=%08x lr=%08x off=%04x val=%08x "
++                "size=%u\n", s->trace_count, pc, lr, (unsigned)offset, val,
++                size);
++        s->trace_count++;
++    }
++    return val;
++}
++
++
++/* --- local experiment: capture GPE command slots and 2D submissions --- */
++static uint32_t cxd90045_sugi_last_cmd;
++static unsigned int cxd90045_sugi_cmd_count;
++static unsigned int cxd90045_sugi_2d_count;
++
++static bool cxd90045_sugi_cmd_trace(void)
++{
++    static int enabled = -1;
++    if (enabled < 0) {
++        enabled = getenv("A7M3_SUGI_CMDS") != NULL;
++    }
++    return enabled;
++}
++
++static bool cxd90045_sugi_addr_ok(hwaddr addr, unsigned int n)
++{
++    return (addr < 0x40000000ULL) ||
++           (addr >= 0x80000000ULL && addr + n <= 0x90000000ULL);
++}
++
++static void cxd90045_sugi_dump_words(const char *tag, unsigned int idx,
++                                     hwaddr addr, unsigned int words)
++{
++    uint32_t buf[1024];
++    unsigned int i;
++    if (!cxd90045_sugi_addr_ok(addr, words * 4)) {
++        return;
++    }
++    if (words > 1024) {
++        words = 1024;
++    }
++    cpu_physical_memory_read(addr, buf, words * 4);
++    fprintf(stderr, "%s[%u] addr=%08x:", tag, idx, (unsigned)addr);
++    for (i = 0; i < words; i++) {
++        fprintf(stderr, " %08x", buf[i]);
++    }
++    fprintf(stderr, "\n");
++}
++
++
++static void cxd90045_sugi_scan_cmd(unsigned int idx, uint32_t addr)
++{
++    uint32_t buf[16];
++    int i;
++    cxd90045_sugi_dump_words("SUGI-CMDX", idx, (hwaddr)addr, 32);
++    if (!cxd90045_sugi_addr_ok((hwaddr)addr, sizeof(buf))) {
++        return;
++    }
++    cpu_physical_memory_read((hwaddr)addr, buf, sizeof(buf));
++    for (i = 0; i + 1 < 16; i++) {
++        if ((buf[i] & 0xf000) == 0xf000 && (buf[i] >> 16) == 0x0116) {
++            uint32_t v = buf[i + 1];
++            cxd90045_sugi_dump_words("SUGI-116B", idx, (hwaddr)v, 32);
++            cxd90045_sugi_dump_words("SUGI-116W", idx,
++                                     (hwaddr)((uint64_t)v << 2), 32);
++            cxd90045_sugi_dump_words("SUGI-116U", idx,
++                                     (hwaddr)((uint64_t)v << 4), 32);
++            break;
++        }
++    }
++}
++
++static void cxd90045_sugi_scan_regs(unsigned int idx, uint32_t base)
++{
++    uint32_t buf[1024];
++    int i;
++    if (!cxd90045_sugi_addr_ok((hwaddr)base, sizeof(buf))) {
++        return;
++    }
++    cpu_physical_memory_read((hwaddr)base, buf, sizeof(buf));
++    for (i = 0; i + 1 < 1024; i++) {
++        uint32_t w = buf[i];
++        if (w >= 0x20000000u && w < 0x30000000u) {
++            cxd90045_sugi_dump_words("SUGI-PTR", idx, (hwaddr)w, 32);
++        }
++        if ((w & 0xffff) == 0xf000) {
++            uint32_t op = w >> 16;
++            uint32_t val = buf[i + 1];
++            if (op == 0x0589 && val) {
++                cxd90045_sugi_dump_words("SUGI-TEX", idx, (hwaddr)val, 64);
++            } else if (op == 0x0112 && val) {
++                cxd90045_sugi_dump_words("SUGI-DST", idx,
++                                         (hwaddr)((uint64_t)val << 4), 64);
++            } else if (op == 0x0116 && val) {
++                cxd90045_sugi_dump_words("SUGI-SRC", idx,
++                                         (hwaddr)((uint64_t)val << 4), 64);
++            }
++            i++;
++        }
++    }
++}
++
++/* --- software rasterizer for the observed 2D command lists --- */
++static bool cxd90045_sugi_exec_enabled(void)
++{
++    static int enabled = -1;
++    if (enabled < 0) {
++        enabled = getenv("A7M3_SUGI_EXEC") != NULL;
++    }
++    return enabled;
++}
++
++typedef struct {
++    uint32_t surf, tex, texw, texh, color;
++    uint32_t r47, r48;
++    uint32_t areaw, areah;
++    unsigned draws;
++} SugiSoftState;
++static SugiSoftState sugi_soft;
++
++static bool cxd90045_sugi_pa_ok(hwaddr a, unsigned n)
++{
++    return (a + n <= 0x40000000ULL) ||
++           (a >= 0x80000000ULL && a + n <= 0x90000000ULL);
++}
++
++static void cxd90045_sugi_surface_dump(unsigned idx)
++{
++    const char *dir = getenv("A7M3_SURF_DIR");
++    char path[256];
++    FILE *f;
++    static unsigned char surf[640 * 480 * 2];
++    if (!dir) {
++        return;
++    }
++    if (!cxd90045_sugi_pa_ok(0x202e0200ULL, sizeof(surf))) {
++        return;
++    }
++    cpu_physical_memory_read(0x202e0200ULL, surf, sizeof(surf));
++    snprintf(path, sizeof(path), "%s/frame_%04u.raw", dir, idx);
++    f = fopen(path, "wb");
++    if (!f) {
++        return;
++    }
++    fwrite(surf, 1, sizeof(surf), f);
++    fclose(f);
++}
++
++static void cxd90045_sugi_soft_draw(unsigned idx)
++{
++    int vx0 = (int16_t)(sugi_soft.r47 & 0xffff);
++    int vy0 = (int16_t)(sugi_soft.r47 >> 16);
++    int vx1 = (int16_t)(sugi_soft.r48 & 0xffff);
++    int vy1 = (int16_t)(sugi_soft.r48 >> 16);
++    int x0, y0, x1, y1, ox0, oy0, ox1, oy1;
++    int tw = (int)sugi_soft.texw, th = (int)sugi_soft.texh;
++    int center = getenv("A7M3_SUGI_CENTER") != NULL ||
++                 getenv("A7M3_SUGI_CENTERSCALE") != NULL;
++    int cscale = getenv("A7M3_SUGI_CENTERSCALE") != NULL;
++    int hybrid = getenv("A7M3_SUGI_HYBRID") != NULL;
++    int cw = sugi_soft.areaw ? (int)sugi_soft.areaw : 640;
++    int ch = sugi_soft.areah ? (int)sugi_soft.areah : 480;
++    uint32_t surf = sugi_soft.surf, tex = sugi_soft.tex;
++    static uint16_t srcrow[4096];
++    static unsigned char dstrow[2048];
++    int y;
++
++    if (sugi_soft.draws++ >= 512) {
++        return;
++    }
++    {
++        const char *skip = getenv("A7M3_SUGI_SKIP_TEX");
++        if (skip && *skip) {
++            char sbuf[128];
++            char *tok;
++            size_t sl = strlen(skip);
++            if (sl >= sizeof(sbuf)) {
++                sl = sizeof(sbuf) - 1;
++            }
++            memcpy(sbuf, skip, sl);
++            sbuf[sl] = 0;
++            for (tok = strtok(sbuf, ","); tok; tok = strtok(NULL, ",")) {
++                unsigned long sv = strtoul(tok, NULL, 16);
++                if ((uint32_t)sv == tex) {
++                    return;
++                }
++            }
++        }
++    }
++    if (center) {
++        x0 = (vx0 + cw) >> 1;
++        x1 = (vx1 + cw) >> 1;
++        y0 = (vy0 + ch) >> 1;
++        y1 = (vy1 + ch) >> 1;
++    } else if (getenv("A7M3_SUGI_HALF")) {
++        x0 = vx0 >> 1;
++        y0 = vy0 >> 1;
++        x1 = vx1 >> 1;
++        y1 = vy1 >> 1;
++    } else {
++        x0 = vx0; y0 = vy0; x1 = vx1; y1 = vy1;
++    }
++    {
++        const char *tdir = getenv("A7M3_TEX_DIR");
++        static unsigned tex_dumps;
++        if (tdir && tex_dumps < 256 && tw > 0 && th > 0 &&
++            tw <= 2048 && th <= 2048 &&
++            cxd90045_sugi_pa_ok(tex, (hwaddr)tw * th * 2)) {
++            char tpath[256];
++            unsigned char *tbuf = g_malloc((size_t)tw * th * 2);
++            snprintf(tpath, sizeof(tpath), "%s/tex_%04u_%dx%d.raw",
++                     tdir, sugi_soft.draws, tw, th);
++            cpu_physical_memory_read(tex, tbuf, (size_t)tw * th * 2);
++            FILE *tf = fopen(tpath, "wb");
++            if (tf) {
++                fwrite(tbuf, 1, (size_t)tw * th * 2, tf);
++                fclose(tf);
++                tex_dumps++;
++            }
++            g_free(tbuf);
++        }
++    }
++    if (sugi_soft.draws <= 300) {
++        fprintf(stderr, "SUGI-SD[%u] surf=%08x tex=%08x %dx%d "
++                "r47=%08x r48=%08x col=%08x%s\n",
++                sugi_soft.draws, surf, tex, tw, th,
++                sugi_soft.r47, sugi_soft.r48, sugi_soft.color,
++                center ? " C" : "");
++    }
++    if (x1 <= x0) { int t = x0; x0 = x1; x1 = t; }
++    if (y1 <= y0) { int t = y0; y0 = y1; y1 = t; }
++    ox0 = x0; oy0 = y0; ox1 = x1; oy1 = y1;
++    if (x0 < 0) x0 = 0;
++    if (y0 < 0) y0 = 0;
++    if (x1 > 640) x1 = 640;
++    if (y1 > 480) y1 = 480;
++    if (x1 <= x0 || y1 <= y0) {
++        return;
++    }
++    if (tw <= 0 || th <= 0 || tw > 2048 || th > 2048) {
++        return;
++    }
++    if (!cxd90045_sugi_pa_ok(surf, 640 * 480 * 2)) {
++        return;
++    }
++    if (!cxd90045_sugi_pa_ok(tex, (hwaddr)tw * th * 2)) {
++        return;
++    }
++    for (y = y0; y < y1; y++) {
++        int v;
++        int x;
++        hwaddr drow = surf + (hwaddr)y * 640 * 2;
++        if (center && (!cscale || (hybrid && (oy1 - oy0) > th + (th >> 1)))) {
++            v = y - oy0;
++            if (v >= 0) v %= th;
++        } else {
++            v = (int)((uint64_t)(y - oy0) * th / (oy1 - oy0));
++            if (v >= th) v = th - 1;
++        }
++        cpu_physical_memory_read(tex + (hwaddr)v * tw * 2, srcrow, tw * 2);
++        cpu_physical_memory_read(drow, dstrow, 640 * 2);
++        for (x = x0; x < x1; x++) {
++            int u;
++            uint16_t pix;
++            unsigned a;
++            if (center && (!cscale || (hybrid && (ox1 - ox0) > tw + (tw >> 1)))) {
++                u = x - ox0;
++                if (u >= 0) u %= tw;
++            } else {
++                u = (int)((uint64_t)(x - ox0) * tw / (ox1 - ox0));
++                if (u >= tw) u = tw - 1;
++            }
++            pix = srcrow[u];
++            a = pix & 0xF;
++            if (a == 0) {
++                continue;
++            }
++            if (a < 0xF) {
++                uint16_t dp = (uint16_t)(dstrow[x * 2] |
++                                         (dstrow[x * 2 + 1] << 8));
++                unsigned sr = (pix >> 12) & 0xF, sg = (pix >> 8) & 0xF;
++                unsigned sb = (pix >> 4) & 0xF;
++                unsigned dr = (dp >> 12) & 0xF, dg = (dp >> 8) & 0xF;
++                unsigned db = (dp >> 4) & 0xF;
++                unsigned rr = (sr * a + dr * (15 - a) + 7) / 15;
++                unsigned rg = (sg * a + dg * (15 - a) + 7) / 15;
++                unsigned rb = (sb * a + db * (15 - a) + 7) / 15;
++                pix = (uint16_t)((rr << 12) | (rg << 8) | (rb << 4) | 0xF);
++            }
++            dstrow[x * 2] = pix & 0xff;
++            dstrow[x * 2 + 1] = pix >> 8;
++        }
++        cpu_physical_memory_write(drow, dstrow, 640 * 2);
++    }
++    cxd90045_sugi_surface_dump(sugi_soft.draws);
++}
++
++static void cxd90045_sugi_soft_exec(unsigned idx, uint32_t base)
++{
++    uint32_t buf[1024];
++    int i;
++    if (!cxd90045_sugi_exec_enabled()) {
++        return;
++    }
++    if (!cxd90045_sugi_addr_ok((hwaddr)base, sizeof(buf))) {
++        return;
++    }
++    cpu_physical_memory_read((hwaddr)base, buf, sizeof(buf));
++    for (i = 0; i + 1 < 1024; i++) {
++        uint32_t w = buf[i];
++        uint32_t op, val;
++        if ((w & 0xffff) != 0xf000) {
++            continue;
++        }
++        op = w >> 16;
++        val = buf[i + 1];
++        switch (op) {
++        case 0x0112:
++            sugi_soft.surf = val << 4;
++            break;
++        case 0x0589:
++            sugi_soft.tex = val << 3;
++            break;
++        case 0x0586:
++        case 0x0587:
++            sugi_soft.texw = val >> 16;
++            sugi_soft.texh = val & 0xffff;
++            break;
++        case 0x0049:
++            sugi_soft.areaw = val & 0xffff;
++            sugi_soft.areah = val >> 16;
++            break;
++        case 0x0047:
++            sugi_soft.r47 = val;
++            break;
++        case 0x0048:
++            sugi_soft.r48 = val;
++            break;
++        case 0x0105:
++            sugi_soft.color = val;
++            break;
++        case 0x0202:
++            cxd90045_sugi_soft_draw(idx);
++            break;
++        default:
++            break;
++        }
++        i++;
++    }
++}
++
++static void cxd90045_sugi_capture_cmd(uint32_t word_addr)
++{
++    unsigned int idx;
++    if (!cxd90045_sugi_cmd_trace() || cxd90045_sugi_cmd_count >= 8192) {
++        return;
++    }
++    idx = cxd90045_sugi_cmd_count++;
++    cxd90045_sugi_dump_words("SUGI-CMDA", idx, (hwaddr)word_addr, 1024);
++    cxd90045_sugi_dump_words("SUGI-CMDB", idx,
++                             (hwaddr)((uint64_t)word_addr << 2), 16);
++    cxd90045_sugi_scan_cmd(idx, word_addr);
++    cxd90045_sugi_scan_cmd(idx, (uint32_t)((uint64_t)word_addr << 2));
++    cxd90045_sugi_scan_regs(idx, word_addr);
++    cxd90045_sugi_soft_exec(idx, word_addr);
++}
++
++
++static void cxd90045_sugi_dump_mem(const char *tag, unsigned int idx,
++                                   uint32_t word_addr, uint32_t bytes)
++{
++    uint32_t buf[64];
++    hwaddr addr = (hwaddr)((uint64_t)word_addr << 2);
++    unsigned int n = bytes > 192 ? 192 : bytes;
++    unsigned int i;
++    if (!n) {
++        return;
++    }
++    if (!((addr < 0x40000000ULL) ||
++          (addr >= 0x80000000ULL && addr + n <= 0x90000000ULL))) {
++        return;
++    }
++    cpu_physical_memory_read(addr, buf, (n + 3) & ~3u);
++    fprintf(stderr, "SUGI-2D%s[%u] addr=%08x n=%u:", tag, idx,
++            (unsigned)addr, n);
++    for (i = 0; i < (n + 3) / 4; i++) {
++        fprintf(stderr, " %08x", buf[i]);
++    }
++    fprintf(stderr, "\n");
++}
++
++static void cxd90045_sugi_capture_2d(CXD90045SugiState *s)
++{
++    uint32_t c00 = s->regs[0xc00 >> 2];
++    uint32_t c04 = s->regs[0xc04 >> 2];
++    uint32_t c08 = s->regs[0xc08 >> 2];
++    uint32_t c0c = s->regs[0xc0c >> 2];
++    uint32_t c10 = s->regs[0xc10 >> 2];
++    uint32_t c20 = s->regs[0xc20 >> 2];
++    uint32_t c24 = s->regs[0xc24 >> 2];
++    uint32_t c28 = s->regs[0xc28 >> 2];
++    if (!cxd90045_sugi_cmd_trace() || cxd90045_sugi_2d_count >= 8192) {
++        return;
++    }
++    fprintf(stderr, "SUGI-2D[%u] c00=%08x c04=%08x c08=%08x c0c=%08x "
++            "c10=%08x c20=%08x c24=%08x c28=%08x\n",
++            cxd90045_sugi_2d_count++, c00, c04, c08, c0c, c10, c20, c24,
++            c28);
++    {
++        unsigned int idx = cxd90045_sugi_2d_count - 1;
++        if (c10 == 8) {
++            cxd90045_sugi_dump_mem("S", idx, c00, c20);
++            cxd90045_sugi_dump_mem("D", idx, c04, c20);
++        } else {
++            cxd90045_sugi_dump_mem("S", idx, c00, 64);
++            cxd90045_sugi_dump_mem("D", idx, c04, 64);
++        }
++    }
++}
++
++static void cxd90045_sugi_write(void *opaque, hwaddr offset, uint64_t value,
++                                unsigned size)
++{
++    CXD90045SugiState *s = opaque;
++    uint32_t idx = offset >> 2;
++    uint32_t low = offset & 0xfff;
++    uint32_t block = (offset >> 12) & (CXD90045_SUGI_NUM_BLOCKS - 1);
++
++    if (idx >= CXD90045_SUGI_NUM_REGS) {
++        return;
++    }
++    s->regs[idx] = (uint32_t)value;
++    if (offset == 0x1804) {
++        cxd90045_sugi_last_cmd = (uint32_t)value;
++    }
++
++    if ((offset == 0x00c0 && (value & 0x20000000u)) ||
++        (offset == 0x1800 && (value & 0x4u)) ||
++        (offset == 0x0c18 && value == 1)) {
++        /* Kick: complete immediately.  The driver reads BAR+0x34 and acks
++         * bit30, bit26 and the low nibble.  The status register the handler
++         * reads is fixed at block 0, so publish every completion there. */
++        s->status[block] = 0xc0000001;
++        s->pending[block] = 1;
++        s->irq_status |= s->status[block];
++        if (offset == 0x1800 && (value & 0x4u)) {
++            cxd90045_sugi_capture_cmd(cxd90045_sugi_last_cmd);
++        }
++        if (offset == 0x0c18 && value == 1) {
++            if (cxd90045_sugi_exec_enabled()) {
++                uint32_t c10 = s->regs[0xc10 >> 2];
++                uint32_t c20 = s->regs[0xc20 >> 2];
++                if (c10 == 8 && c20 > 0 && c20 <= 0x100000) {
++                    hwaddr src = (hwaddr)((uint64_t)s->regs[0xc00 >> 2] << 2);
++                    hwaddr dst = (hwaddr)((uint64_t)s->regs[0xc04 >> 2] << 2);
++                    if (cxd90045_sugi_pa_ok(src, c20) &&
++                        cxd90045_sugi_pa_ok(dst, c20)) {
++                        static unsigned char copybuf[0x10000];
++                        uint32_t done = 0;
++                        while (done < c20) {
++                            uint32_t n = c20 - done;
++                            if (n > sizeof(copybuf)) {
++                                n = sizeof(copybuf);
++                            }
++                            cpu_physical_memory_read(src + done, copybuf, n);
++                            cpu_physical_memory_write(dst + done, copybuf, n);
++                            done += n;
++                        }
++                    }
++                }
++            }
++            cxd90045_sugi_capture_2d(s);
++        }
++        qemu_irq_raise(s->irq);
++    } else if (cxd90045_sugi_ack_off(low)) {
++        s->pending[block] = 0;
++        s->irq_status = 0;
++        qemu_irq_lower(s->irq);
++    }
++
++    if (cxd90045_sugi_trace() && s->trace_count < 4000) {
++        uint32_t pc = 0, lr = 0;
++        CPUState *cpu = current_cpu;
++        if (cpu) {
++            pc = ARM_CPU(cpu)->env.regs[15];
++            lr = ARM_CPU(cpu)->env.regs[14];
++        }
++        fprintf(stderr, "A7M3-SUGI WR[%u] pc=%08x lr=%08x off=%04x val=%08x "
++                "size=%u\n", s->trace_count, pc, lr, (unsigned)offset,
++                (unsigned)value, size);
++        s->trace_count++;
++    }
++}
++
++static const MemoryRegionOps cxd90045_sugi_ops = {
++    .read = cxd90045_sugi_read,
++    .write = cxd90045_sugi_write,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++    .endianness = DEVICE_NATIVE_ENDIAN,
++};
++
++static void cxd90045_sugi_reset(DeviceState *dev)
++{
++    CXD90045SugiState *s = CXD90045_SUGI(dev);
++    memset(s->regs, 0, sizeof(s->regs));
++    memset(s->status, 0, sizeof(s->status));
++    memset(s->pending, 0, sizeof(s->pending));
++    s->irq_status = 0;
++}
++
++static void cxd90045_sugi_realize(DeviceState *dev, Error **errp)
++{
++    CXD90045SugiState *s = CXD90045_SUGI(dev);
++
++    memory_region_init_io(&s->mmio, OBJECT(dev), &cxd90045_sugi_ops, s,
++                          TYPE_CXD90045_SUGI, CXD90045_SUGI_SIZE);
++    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->mmio);
++    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
++}
++
++static void cxd90045_sugi_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    dc->realize = cxd90045_sugi_realize;
++    dc->reset = cxd90045_sugi_reset;
++}
++
++static const TypeInfo cxd90045_sugi_info = {
++    .name = TYPE_CXD90045_SUGI,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(CXD90045SugiState),
++    .class_init = cxd90045_sugi_class_init,
++};
++
++static void cxd90045_sugi_register_types(void)
++{
++    type_register_static(&cxd90045_sugi_info);
++}
++
++type_init(cxd90045_sugi_register_types)
++
++/* --- live QEMU display of the Sugilite draw surface (PA 0x202e0200) --- */
++static QemuConsole *sugi_display_con;
++static QEMUTimer *sugi_display_timer;
++
++static void cxd90045_display_paint(void *opaque)
++{
++    DisplaySurface *surf;
++    uint8_t *dst;
++    int stride, x, y;
++    static uint16_t src[640 * 480];
++
++    if (!sugi_display_con) {
++        return;
++    }
++    surf = qemu_console_surface(sugi_display_con);
++    if (!surf) {
++        return;
++    }
++    dst = surface_data(surf);
++    stride = surface_stride(surf);
++    if (cxd90045_sugi_pa_ok(0x202e0200ULL, sizeof(src))) {
++        cpu_physical_memory_read(0x202e0200ULL, src, sizeof(src));
++        for (y = 0; y < 480; y++) {
++            uint32_t *row = (uint32_t *)(dst + (size_t)y * stride);
++            for (x = 0; x < 640; x++) {
++                uint16_t v = src[y * 640 + x];
++                uint32_t r = (v >> 12) & 15;
++                uint32_t g = (v >> 8) & 15;
++                uint32_t b = (v >> 4) & 15;
++                row[x] = (r * 17 << 16) | (g * 17 << 8) | (b * 17);
++            }
++        }
++        dpy_gfx_update(sugi_display_con, 0, 0, 640, 480);
++    }
++    timer_mod(sugi_display_timer,
++              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 40);
++}
++
++static const GraphicHwOps sugi_display_ops = {
++    .gfx_update = cxd90045_display_paint,
++};
++
++static void cxd90045_display_init(void)
++{
++    if (getenv("A7M3_NO_GFX_CONSOLE")) {
++        return;
++    }
++    if (sugi_display_con) {
++        return;
++    }
++    sugi_display_con = graphic_console_init(NULL, 0, &sugi_display_ops, NULL);
++    qemu_console_resize(sugi_display_con, 640, 480);
++    sugi_display_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
++                                      cxd90045_display_paint, NULL);
++    timer_mod(sugi_display_timer,
++              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 500);
++}
++
+ static void cxd90045_init(MachineState *machine)
+ {
+     DriveInfo *dinfo;
+@@ -987,6 +1846,7 @@ static void cxd90045_init(MachineState *machine)
+     Object *cpu;
+     BusState *bus;
+     qemu_irq irq[CXD90045_NUM_IRQ - CXD90045_IRQ_OFFSET];
++    CXD90045LiroState *liro_state;
+     int i;
+ 
+     dinfo = drive_get(IF_MTD, 0, 0);
+@@ -1005,13 +1865,20 @@ static void cxd90045_init(MachineState *machine)
+     memory_region_init_ram(mem, NULL, "ddr1", CXD90045_DDR1_SIZE, &error_fatal);
+     memory_region_add_subregion(get_system_memory(), CXD90045_DDR1_BASE, mem);
+ 
++    liro_state = g_new0(CXD90045LiroState, 1);
++    mem = g_new(MemoryRegion, 1);
++    memory_region_init_io(mem, NULL, &cxd90045_liro_ops, liro_state,
++                          "liro-regs", CXD90045_LIRO_SIZE);
++    memory_region_add_subregion(get_system_memory(), CXD90045_LIRO_BASE, mem);
++
+     mem = g_new(MemoryRegion, 1);
+     memory_region_init_ram(mem, NULL, "sram", CXD90045_SRAM_SIZE, &error_fatal);
+     memory_region_add_subregion(get_system_memory(), CXD90045_SRAM_BASE, mem);
+ 
+     mem = g_new(MemoryRegion, 1);
+-    memory_region_init_ram(mem, NULL, "bootrom", CXD90045_BOOTROM_SIZE, &error_fatal);
+-    memory_region_set_readonly(mem, true);
++    /* The Linux kernel uses high vectors at 0xffff0000 and copies its
++     * vector page there, so this must be writable RAM after reset. */
++    memory_region_init_ram(mem, NULL, "vectors", CXD90045_BOOTROM_SIZE, &error_fatal);
+     memory_region_add_subregion(get_system_memory(), CXD90045_BOOTROM_BASE, mem);
+ 
+     dev = qdev_new(TYPE_A9MPCORE_PRIV);
+@@ -1024,6 +1891,12 @@ static void cxd90045_init(MachineState *machine)
+         irq[i] = qdev_get_gpio_in(dev, i);
+     }
+ 
++    dev = qdev_new(TYPE_CXD90045_SUGI);
++    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
++    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, CXD90045_SUGI_BASE);
++    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
++                       irq[CXD90045_IRQ_SUGI - CXD90045_IRQ_OFFSET]);
++
+     for (i = 0; i < CXD90045_NUM_GPIO; i++) {
+         dev = qdev_new("bionz_gpio");
+         qdev_prop_set_uint8(dev, "version", 3);
+@@ -1033,7 +1906,7 @@ static void cxd90045_init(MachineState *machine)
+     }
+ 
+     dev = qdev_new("bionz_bootcon");
+-    qdev_prop_set_chr(dev, "chardev", serial_hd(0));
++    /* Local port: serial0 is reserved for the PL011 UART used as Linux console. */
+     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, CXD90045_BOOTCON_BASE);
+ 
+@@ -1072,9 +1945,40 @@ static void cxd90045_init(MachineState *machine)
+     }
+ 
+     if (machine->kernel_filename) {
++        ssize_t initrd_size;
++        /*
++         * Sony's kernel expects the bootloader (EXBL) to have populated the
++         * initial page tables, including the page holding swapper_pg_dir.
++         * Without a bootloader, setup_arch faults reading the ATAGS.
++         * The kernel is linked for PAGE_OFFSET 0x60000000 / PHYS_OFFSET 0;
++         * before setup_arch reads the ATAGS it does __va(0x00010000), which
++         * is VA 0x60010000.  Prepopulate that one 1 MiB section (the head
++         * code maps the kernel image sections itself).
++         */
++        {
++            uint32_t pgd[4096];
++            memset(pgd, 0, sizeof(pgd));
++            pgd[0x600] = (CXD90045_DDR0_BASE & 0xfff00000) | 0x00011c0e;
++            uint32_t readback = 0;
++            address_space_write(&address_space_memory,
++                                CXD90045_DDR0_BASE + 0x00104000,
++                                MEMTXATTRS_UNSPECIFIED, pgd, sizeof(pgd));
++            address_space_read(&address_space_memory,
++                               CXD90045_DDR0_BASE + 0x00105800,
++                               MEMTXATTRS_UNSPECIFIED, &readback, 4);
++            fprintf(stderr, "A7M3: wrote initial pgd at 0x%08x "
++                    "(pgd[0x600]=0x%08x readback=0x%08x)\n",
++                    (unsigned)(CXD90045_DDR0_BASE + 0x00104000),
++                    (unsigned)pgd[0x600], (unsigned)readback);
++        }
+         load_image_targphys(machine->kernel_filename, CXD90045_DDR0_BASE + CXD90045_TEXT_OFFSET, CXD90045_DDR0_SIZE - CXD90045_TEXT_OFFSET);
+-        load_image_targphys(machine->initrd_filename, CXD90045_DDR0_BASE + CXD90045_INITRD_OFFSET, CXD90045_DDR0_SIZE - CXD90045_INITRD_OFFSET);
+-        cxd_write_bootloader(CXD90045_BOOTROM_BASE, CXD90045_DDR0_BASE + CXD90045_TEXT_OFFSET);
++        initrd_size = load_image_targphys(machine->initrd_filename, CXD90045_DDR0_BASE + CXD90045_INITRD_OFFSET, CXD90045_DDR0_SIZE - CXD90045_INITRD_OFFSET);
++        cxd90045_write_atags(CXD90045_ATAGS_ADDR,
++                             CXD90045_DDR0_BASE + CXD90045_INITRD_OFFSET,
++                             initrd_size, CXD90045_CMDLINE);
++        cxd_write_bootloader_with_machine(CXD90045_BOOTROM_BASE,
++                                          CXD90045_DDR0_BASE + CXD90045_TEXT_OFFSET,
++                                          0x11a, CXD90045_ATAGS_ADDR);
+     } else if (bios_name) {
+         load_image_targphys(bios_name, CXD90045_BOOTROM_BASE, CXD90045_BOOTROM_SIZE);
+     } else if (drive) {
+@@ -1091,6 +1995,8 @@ static void cxd90045_init(MachineState *machine)
+ 
+     cxd_add_const_reg("unknown0", 0xf2908008, 1);
+     cxd_add_const_reg("unknown1", 0xf290c008, 1);
++
++    cxd90045_display_init();
+ }
+ 
+ static void cxd4108_machine_init(MachineClass *mc)
+diff --git a/hw/char/pl011.c b/hw/char/pl011.c
+index 13e784f..abb97a8 100644
+--- a/hw/char/pl011.c
++++ b/hw/char/pl011.c
+@@ -109,6 +109,14 @@ static uint64_t pl011_read(void *opaque, hwaddr offset,
+         r = s->rsr;
+         break;
+     case 6: /* UARTFR */
++        {
++            static int a7m3_fr_count;
++            if (a7m3_fr_count < 200) {
++                fprintf(stderr, "A7M3-PL011-FR[%d] = 0x%x\n",
++                        a7m3_fr_count, s->flags);
++            }
++            a7m3_fr_count++;
++        }
+         r = s->flags;
+         break;
+     case 8: /* UARTILPR */
+@@ -177,10 +185,29 @@ static void pl011_write(void *opaque, hwaddr offset,
+ 
+     trace_pl011_write(offset, value);
+ 
++    {
++        static int a7m3_wr_count;
++        if (a7m3_wr_count < 400) {
++            fprintf(stderr, "A7M3-PL011-WR[%d] off=0x%x val=0x%llx size=%u\n",
++                    a7m3_wr_count, (unsigned)offset,
++                    (unsigned long long)value, size);
++        }
++        a7m3_wr_count++;
++    }
++
+     switch (offset >> 2) {
+     case 0: /* UARTDR */
+         /* ??? Check if transmitter is enabled.  */
+         ch = value;
++        {
++            static int a7m3_tx_count;
++            if (a7m3_tx_count < 200) {
++                fprintf(stderr, "A7M3-PL011-TX[%d] 0x%02x %c\n",
++                        a7m3_tx_count, ch,
++                        (ch >= 32 && ch < 127) ? ch : '.');
++            }
++            a7m3_tx_count++;
++        }
+         /* XXX this blocks entire thread. Rewrite to use
+          * qemu_chr_fe_write and background I/O callbacks */
+         qemu_chr_fe_write_all(&s->chr, &ch, 1);
+diff --git a/target/arm/helper.c b/target/arm/helper.c
+index ce0f378..ac11cd4 100644
+--- a/target/arm/helper.c
++++ b/target/arm/helper.c
+@@ -20,6 +20,7 @@
+ #include "qemu/crc32c.h"
+ #include "qemu/qemu-print.h"
+ #include "exec/exec-all.h"
++#include "exec/address-spaces.h"
+ #include <zlib.h> /* For crc32 */
+ #include "hw/irq.h"
+ #include "hw/semihosting/semihost.h"
+@@ -9856,6 +9857,33 @@ void arm_cpu_do_interrupt(CPUState *cs)
+     arm_log_exception(cs->exception_index);
+     qemu_log_mask(CPU_LOG_INT, "...from EL%d to EL%d\n", arm_current_el(env),
+                   new_el);
++    if (cs->exception_index == EXCP_DATA_ABORT) {
++        qemu_log_mask(CPU_LOG_INT,
++                      "...PC 0x%" PRIx32 " DFAR 0x%x TTBR0 0x%" PRIx64
++                      " TTBCR 0x%x SCTLR 0x%" PRIx64 "\n",
++                      env->regs[15], env->cp15.dfar_ns,
++                      env->cp15.ttbr0_ns, env->cp15.tcr_el[1].raw_tcr,
++                      env->cp15.sctlr_el[1]);
++        qemu_log_mask(CPU_LOG_INT,
++                      "...regs r0=0x%" PRIx32 " r1=0x%" PRIx32
++                      " r2=0x%" PRIx32 " r3=0x%" PRIx32
++                      " r12=0x%" PRIx32 " sp=0x%" PRIx32
++                      " lr=0x%" PRIx32 " cpsr=0x%" PRIx32 "\n",
++                      env->regs[0], env->regs[1], env->regs[2],
++                      env->regs[3], env->regs[12], env->regs[13],
++                      env->regs[14], env->uncached_cpsr);
++        {
++            uint64_t t = env->cp15.ttbr0_ns & ~0x3fffULL;
++            uint32_t fa = (uint32_t)env->exception.vaddress;
++            uint32_t idx = (fa >> 20) & 0xfff;
++            uint32_t ent = 0xdeadbeef;
++            address_space_read(&address_space_memory, t + idx * 4,
++                               MEMTXATTRS_UNSPECIFIED, &ent, 4);
++            qemu_log_mask(CPU_LOG_INT,
++                          "...walkL1 base=0x%" PRIx64
++                          " idx=0x%x ent=0x%x\n", t, idx, ent);
++        }
++    }
+     if (qemu_loglevel_mask(CPU_LOG_INT)
+         && !excp_is_internal(cs->exception_index)) {
+         qemu_log_mask(CPU_LOG_INT, "...with ESR 0x%x/0x%" PRIx32 "\n",

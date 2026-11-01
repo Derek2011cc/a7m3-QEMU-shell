@@ -1,0 +1,6 @@
+firmware/
+qemu-src/
+qemu-build/
+__pycache__/
+*.pyc
+*.log
