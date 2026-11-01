@@ -194,7 +194,7 @@ ls /usr/bin
 - [ma1co/Sony-PMCA-RE](https://github.com/ma1co/Sony-PMCA-RE) — 服务模式 USB 协议与认证；
 - [ma1co/fwtool.py](https://github.com/ma1co/fwtool.py) — Sony 固件包解析；
 - [QEMU](https://www.qemu.org/) — 全系统模拟器；
-- 前序 A7M3 逆向报告（本仓库 `report/2026-10-17-qemu-native-camera/a7m3`）— 启动链、补丁脚本与踩坑记录；
+- [A7M3-Firmware-QEMU-Boot-Experiment](https://github.com/Derek2011cc/A7M3-Firmware-QEMU-Boot-Experiment) — 前序 A7M3 逆向记录、启动链、补丁脚本与踩坑记录；
 - [a7m3-connect-shell](https://github.com/Derek2011cc/a7m3-connect-shell) — 服务模式分区转储工具。
 
 ## 许可
