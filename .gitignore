@@ -1,4 +1,5 @@
-firmware/
+firmware/qemu-emmc-2g.img
+firmware/service-dump/
 qemu-src/
 qemu-build/
 __pycache__/

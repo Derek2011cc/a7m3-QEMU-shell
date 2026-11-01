@@ -1,0 +1,6 @@
+firmware/*.bin binary
+firmware/*.img binary
+firmware/image/part-* binary
+qemu-prebuilt/qemu-system-arm binary
+patches/*.patch text eol=lf
+*.sh text eol=lf

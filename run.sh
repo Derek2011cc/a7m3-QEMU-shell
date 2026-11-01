@@ -6,7 +6,8 @@
 #
 # Environment:
 #   A7M3_DATA      firmware directory (default: ./firmware)
-#   QEMU_BINARY    qemu-system-arm path (default: ./qemu-build/arm-softmmu/...)
+#   QEMU_BINARY    override; default: ./qemu-prebuilt/qemu-system-arm,
+#                  otherwise ./qemu-build/arm-softmmu/qemu-system-arm
 #   A7M3_WEB_PORT  web terminal port (default: 8099)
 set -euo pipefail
 
@@ -19,17 +20,29 @@ export A7M3_NO_GFX_CONSOLE=1
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 D="${A7M3_DATA:-$HERE/firmware}"
-QEMU="${QEMU_BINARY:-$HERE/qemu-build/arm-softmmu/qemu-system-arm}"
 MODE="${1:-web}"
+
+# Firmware image is shipped compressed in firmware/image/part-*.
+if [ ! -f "$D/qemu-emmc-2g.img" ] && [ -d "$D/image" ]; then
+    bash "$HERE/assemble.sh" "$D"
+fi
+
+if [ -n "${QEMU_BINARY:-}" ]; then
+    QEMU="$QEMU_BINARY"
+elif [ -x "$HERE/qemu-prebuilt/qemu-system-arm" ]; then
+    QEMU="$HERE/qemu-prebuilt/qemu-system-arm"
+else
+    QEMU="$HERE/qemu-build/arm-softmmu/qemu-system-arm"
+fi
 
 for f in vmlinux-console.bin initrd-qemu.img qemu-emmc-2g.img; do
     if [ ! -f "$D/$f" ]; then
-        echo "缺少 $D/$f（先运行 ./import.sh）" >&2
+        echo "缺少 $D/$f（先运行 ./assemble.sh 或 ./import.sh）" >&2
         exit 1
     fi
 done
 if [ ! -x "$QEMU" ]; then
-    echo "缺少 QEMU: $QEMU（先运行 ./setup.sh）" >&2
+    echo "缺少 QEMU: $QEMU（运行 ./setup.sh 构建，或用 qemu-prebuilt/）" >&2
     exit 1
 fi
 
